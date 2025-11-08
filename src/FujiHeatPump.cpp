@@ -4,10 +4,12 @@
 
 
 bool FujiHeatPump::isZoneMessage(byte buf[8]) {
-    // Zone messages have a specific signature: 20 A1 58 in first 3 bytes
-    return (buf[0] == kZoneMessageSignature0 && 
-            buf[1] == kZoneMessageSignature1 && 
-            buf[2] == kZoneMessageSignature2);
+    // Zone messages are identified by byte 2 being 0x50 (when AC sends) or 0x58 (when we send)
+    // They can come from different addresses:
+    // - 20 A1 50/58: from PRIMARY (32) to controller (33)
+    // - 0 A0 50: from AC (0) to PRIMARY (32)
+    // The key identifier is byte 2, not the source/dest addresses
+    return (buf[2] == 0x50 || buf[2] == 0x58);
 }
 
 FujiFrame FujiHeatPump::decodeFrame() {
@@ -242,9 +244,16 @@ void FujiHeatPump::connect(HardwareSerial *serial, bool secondary, int rxPin=-1,
         controllerAddress = static_cast<byte>(FujiAddress::PRIMARY);
     }
     
-    lastFrameReceived = 0;
-    lastFrameSent = 0;
-    updateRetryCount = 0;
+            lastFrameReceived = 0;
+            lastFrameSent = 0;
+            lastRetryAttempt = 0;
+            updateFirstSent = 0;
+            updateRetryCount = 0;
+    
+    // Initialize zone state
+    initialZoneStateReceived = false;
+    memset(&currentZoneState, 0, sizeof(ZoneFrame));
+    memset(&zoneUpdateState, 0, sizeof(ZoneFrame));
 }
 
 void printBinary(byte value) {
@@ -287,17 +296,32 @@ void FujiHeatPump::sendPendingFrame() {
         }
         updateFields = 0;
         updateRetryCount = 0;
+        lastRetryAttempt = 0;
+        updateFirstSent = 0;
         return;
     }
     
     // We have updates to send - construct a frame even if pendingFrame is false
     // This handles the case where we received a zone message but have regular updates pending
-    // Increase timing window to 60ms for more reliability
+    // LIN bus requires frames to be sent 50-60ms after receiving - this is CRITICAL
     unsigned long timeSinceLastFrame = (lastFrameSent > 0) ? (millis() - lastFrameSent) : (millis() - lastFrameReceived);
-    if(timeSinceLastFrame < 60 && lastFrameReceived != 0) {
-        // Not enough time has passed, wait for next cycle
-        // DON'T clear updateFields - keep them pending
-        return;
+    if(lastFrameReceived != 0) {
+        if(timeSinceLastFrame < kMinFrameDelay) {
+            // Not enough time has passed - need minimum delay for LIN bus timing
+            // DON'T clear updateFields - keep them pending
+            return;
+        }
+        if(timeSinceLastFrame > kMaxFrameDelay) {
+            // Too much time has passed - we've missed the LIN bus timing window
+            // Don't send now - wait for the next frame from the AC to get a new timing window
+            // But enforce retry backoff to prevent rapid-fire attempts
+            if(lastRetryAttempt > 0 && (millis() - lastRetryAttempt) < kMinRetryDelay) {
+                // Not enough time since last retry attempt - wait a bit longer
+                return;
+            }
+            // We're outside the timing window, but enough time has passed for retry backoff
+            // Still try to send, but this might fail (we've missed the optimal window)
+        }
     }
     
     FujiFrame ff;
@@ -318,7 +342,9 @@ void FujiHeatPump::sendPendingFrame() {
         ff.controllerPresent = 1;
     }
     
-    ff.updateMagic = 0;
+    // Preserve updateMagic from currentState - the AC may require it to match
+    // Only set to 0 if currentState doesn't have a valid value
+    // ff.updateMagic is already copied from currentState via memcpy above
     ff.unknownBit = true;
     ff.writeBit = 1;  // We have updates, so set write bit
     ff.messageType = static_cast<byte>(FujiMessageType::STATUS);
@@ -352,6 +378,19 @@ void FujiHeatPump::sendPendingFrame() {
     if(debugPrint) {
         Serial.printf("--> (constructed) ");
         printFrame(writeBuf, ff);
+        // Show what we're trying to update
+        if(updateFields & kFanModeUpdateMask) {
+            Serial.printf("  [Updating fanMode to %d]\n", updateState.fanMode);
+        }
+        if(updateFields & kOnOffUpdateMask) {
+            Serial.printf("  [Updating onOff to %d]\n", updateState.onOff);
+        }
+        if(updateFields & kTempUpdateMask) {
+            Serial.printf("  [Updating temp to %d]\n", updateState.temperature);
+        }
+        if(updateFields & kModeUpdateMask) {
+            Serial.printf("  [Updating mode to %d]\n", updateState.acMode);
+        }
     }
     
     for(int i=0; i<8; i++) {
@@ -363,14 +402,28 @@ void FujiHeatPump::sendPendingFrame() {
     pendingFrame = false;
     // DON'T clear updateFields here - wait for confirmation from unit
     // Store what we sent so we can verify it was applied
+    if(updateRetryCount == 0) {
+        // First time sending this update - record when we first sent it
+        updateFirstSent = millis();
+    }
     updateRetryCount++;  // Increment retry counter
     lastFrameSent = millis();
+    lastRetryAttempt = millis();  // Track when we attempted this retry
     
     if(debugPrint) {
         Serial.printf("Sent update frame (retry %d/%d)\n", updateRetryCount, kMaxUpdateRetries);
     }
     
-    _serial->readBytes(writeBuf, 8); // read back our own frame so we dont process it again
+    // Read back our own frame with timeout to prevent blocking
+    // Use a short timeout since we just sent the frame
+    unsigned long readStart = millis();
+    int bytesRead = 0;
+    while(bytesRead < 8 && (millis() - readStart) < 50) {
+        if(_serial->available()) {
+            writeBuf[bytesRead++] = _serial->read();
+        }
+    }
+    // If we didn't read all 8 bytes, that's okay - we'll process it in waitForFrame()
     
     // DON'T update currentState here - wait for confirmation from the unit
     // This ensures currentState reflects what the unit actually has, not what we sent
@@ -380,11 +433,13 @@ bool FujiHeatPump::sendPendingZoneFrame() {
     if(pendingZoneFrame) {
         // Ensure enough time has passed since last frame was sent/received
         // This prevents sending zone frames too close to regular frames
-        // Increase to 60ms for more reliability
+        // LIN bus requires frames to be sent 50-60ms after receiving
         unsigned long timeSinceLastFrame = (lastFrameSent > 0) ? (millis() - lastFrameSent) : (millis() - lastFrameReceived);
-        if(timeSinceLastFrame < 60) {
-            // Not enough time has passed, wait for next cycle
-            return false;
+        if(lastFrameReceived != 0) {
+            if(timeSinceLastFrame < kMinFrameDelay) {
+                // Not enough time has passed - need minimum delay for LIN bus timing
+                return false;
+            }
         }
         
         // Encode the zone frame from zoneUpdateState
@@ -413,8 +468,15 @@ bool FujiHeatPump::sendPendingZoneFrame() {
         pendingZoneFrame = false;
         lastFrameSent = millis();
         
-        // Read back our own frame so we don't process it again
-        _serial->readBytes(sendBuf, 8);
+        // Read back our own frame with timeout to prevent blocking
+        unsigned long readStart = millis();
+        int bytesRead = 0;
+        while(bytesRead < 8 && (millis() - readStart) < 50) {
+            if(_serial->available()) {
+                sendBuf[bytesRead++] = _serial->read();
+            }
+        }
+        // If we didn't read all 8 bytes, that's okay - we'll process it in waitForFrame()
         return true;
     }
     return false;
@@ -442,21 +504,23 @@ bool FujiHeatPump::waitForFrame() {
         if(isZoneMessage(readBuf)) {
             ZoneFrame zf = decodeZoneFrame();
             
-            if(debugPrint) {
-                Serial.printf("<-- ZONE: %X %X %X %X %X %X %X %X  ", 
-                    readBuf[0], readBuf[1], readBuf[2], readBuf[3], 
-                    readBuf[4], readBuf[5], readBuf[6], readBuf[7]);
-                Serial.printf("zoneGroup: %d, zones[0]: %d, zones[1]: %d\n",
-                    static_cast<byte>(zf.zoneGroup), zf.zones[0], zf.zones[1]);
-            }
+            // Update lastFrameReceived FIRST, before any blocking operations
+            // This ensures timing calculations are accurate
+            lastFrameReceived = millis();
             
             // Update current zone state
             memcpy(&currentZoneState, &zf, sizeof(ZoneFrame));
             initialZoneStateReceived = true;
             
-            // Update lastFrameReceived so timing checks work for regular frames
-            // Zone messages are still valid frames for timing purposes
-            lastFrameReceived = millis();
+            // Debug prints AFTER timing-critical operations (combined to reduce blocking)
+            if(debugPrint) {
+                Serial.printf("<-- ZONE: %X %X %X %X %X %X %X %X  zoneGroup: %d, zones[0]: %d, zones[1]: %d (updated)\n",
+                    readBuf[0], readBuf[1], readBuf[2], readBuf[3], 
+                    readBuf[4], readBuf[5], readBuf[6], readBuf[7],
+                    static_cast<byte>(currentZoneState.zoneGroup), 
+                    currentZoneState.zones[0], 
+                    currentZoneState.zones[1]);
+            }
             
             // Don't send a reply for zone messages - they're informational
             return true;
@@ -469,150 +533,543 @@ bool FujiHeatPump::waitForFrame() {
             printFrame(readBuf, ff);
         }
         
+        // Check for confirmation in frames from address 0 (primary AC controller) to PRIMARY (32)
+        // The AC sends updated state in these frames, not just in frames to our controller
+        // Only check for confirmation after a delay to give the AC time to process the change
+        if(ff.messageSource == 0 && ff.messageDest == static_cast<byte>(FujiAddress::PRIMARY) && 
+           ff.messageType == static_cast<byte>(FujiMessageType::STATUS) && updateFields != 0 &&
+           updateFirstSent > 0 && (millis() - updateFirstSent) >= 200) {
+            
+            if(debugPrint) {
+                Serial.printf("Checking confirmation in AC->PRIMARY frame (updateFields=0x%02X, sent %lums ago)\n", 
+                    updateFields, millis() - updateFirstSent);
+            }
+            
+            // Update timing for LIN bus - these frames are part of the communication cycle
+            lastFrameReceived = millis();
+            
+            // Save the ORIGINAL received state values for confirmation check
+            byte receivedOnOff = ff.onOff;
+            byte receivedTemp = ff.temperature;
+            byte receivedMode = ff.acMode;
+            byte receivedFanMode = ff.fanMode;
+            byte receivedSwingMode = ff.swingMode;
+            byte receivedSwingStep = ff.swingStep;
+            byte receivedEconomyMode = ff.economyMode;
+            
+            // Check if the unit has applied our updates by comparing received state with what we sent
+            bool updatesConfirmed = true;
+            if(updateFields & kOnOffUpdateMask) {
+                if(receivedOnOff != updateState.onOff) {
+                    updatesConfirmed = false;
+                    if(debugPrint) {
+                        Serial.printf("OnOff mismatch: received=%d, expected=%d\n", receivedOnOff, updateState.onOff);
+                    }
+                }
+            }
+            if(updateFields & kTempUpdateMask) {
+                if(receivedTemp != updateState.temperature) {
+                    updatesConfirmed = false;
+                    if(debugPrint) {
+                        Serial.printf("Temp mismatch: received=%d, expected=%d\n", receivedTemp, updateState.temperature);
+                    }
+                }
+            }
+            if(updateFields & kModeUpdateMask) {
+                if(receivedMode != updateState.acMode) {
+                    updatesConfirmed = false;
+                    if(debugPrint) {
+                        Serial.printf("Mode mismatch: received=%d, expected=%d\n", receivedMode, updateState.acMode);
+                    }
+                }
+            }
+            if(updateFields & kFanModeUpdateMask) {
+                if(receivedFanMode != updateState.fanMode) {
+                    updatesConfirmed = false;
+                    if(debugPrint) {
+                        Serial.printf("FanMode mismatch: received=%d, expected=%d\n", receivedFanMode, updateState.fanMode);
+                    }
+                }
+            }
+            if(updateFields & kSwingModeUpdateMask) {
+                if(receivedSwingMode != updateState.swingMode) {
+                    updatesConfirmed = false;
+                    if(debugPrint) {
+                        Serial.printf("SwingMode mismatch: received=%d, expected=%d\n", receivedSwingMode, updateState.swingMode);
+                    }
+                }
+            }
+            if(updateFields & kSwingStepUpdateMask) {
+                if(receivedSwingStep != updateState.swingStep) {
+                    updatesConfirmed = false;
+                    if(debugPrint) {
+                        Serial.printf("SwingStep mismatch: received=%d, expected=%d\n", receivedSwingStep, updateState.swingStep);
+                    }
+                }
+            }
+            if(updateFields & kEconomyModeUpdateMask) {
+                if(receivedEconomyMode != updateState.economyMode) {
+                    updatesConfirmed = false;
+                    if(debugPrint) {
+                        Serial.printf("EconomyMode mismatch: received=%d, expected=%d\n", receivedEconomyMode, updateState.economyMode);
+                    }
+                }
+            }
+            
+            // Always update acError - this is a sensor reading that changes independently
+            // and should always be kept current, regardless of whether other updates are confirmed
+            currentState.acError = ff.acError;
+            
+            // Don't update controllerTemp from AC->PRIMARY frames - these frames don't contain valid controllerTemp
+            // controllerTemp is only valid in frames from PRIMARY (32) to controller or frames to our controller
+            // Updating it here would overwrite the correct value with 0
+            
+            // IMPORTANT: Update currentState for fields we're NOT trying to update
+            // This ensures that when we construct frames in sendPendingFrame(), we have the correct
+            // values for fields we're not changing (e.g., if we're only updating temperature, we need
+            // the correct onOff and acMode values so we don't accidentally turn off the AC)
+            if(!(updateFields & kOnOffUpdateMask)) {
+                currentState.onOff = receivedOnOff;
+            }
+            if(!(updateFields & kTempUpdateMask)) {
+                currentState.temperature = receivedTemp;
+            }
+            if(!(updateFields & kModeUpdateMask)) {
+                currentState.acMode = receivedMode;
+            }
+            if(!(updateFields & kFanModeUpdateMask)) {
+                currentState.fanMode = receivedFanMode;
+            }
+            if(!(updateFields & kSwingModeUpdateMask)) {
+                currentState.swingMode = receivedSwingMode;
+            }
+            if(!(updateFields & kSwingStepUpdateMask)) {
+                currentState.swingStep = receivedSwingStep;
+            }
+            if(!(updateFields & kEconomyModeUpdateMask)) {
+                currentState.economyMode = receivedEconomyMode;
+            }
+            
+            // If updates are confirmed, clear the flags and reset retry counter
+            if(updatesConfirmed) {
+                if(debugPrint && updateRetryCount > 0) {
+                    Serial.printf("Updates confirmed after %d retries (from AC->PRIMARY frame)\n", updateRetryCount);
+                }
+                // Update currentState with the confirmed values for fields we WERE trying to update
+                // This ensures currentState reflects what the AC actually has
+                if(updateFields & kOnOffUpdateMask) {
+                    currentState.onOff = receivedOnOff;
+                }
+                if(updateFields & kTempUpdateMask) {
+                    currentState.temperature = receivedTemp;
+                }
+                if(updateFields & kModeUpdateMask) {
+                    currentState.acMode = receivedMode;
+                }
+                if(updateFields & kFanModeUpdateMask) {
+                    currentState.fanMode = receivedFanMode;
+                }
+                if(updateFields & kSwingModeUpdateMask) {
+                    currentState.swingMode = receivedSwingMode;
+                }
+                if(updateFields & kSwingStepUpdateMask) {
+                    currentState.swingStep = receivedSwingStep;
+                }
+                if(updateFields & kEconomyModeUpdateMask) {
+                    currentState.economyMode = receivedEconomyMode;
+                }
+                
+                updateFields = 0;
+                updateRetryCount = 0;
+                lastRetryAttempt = 0;
+                updateFirstSent = 0;
+            }
+            // If updates are NOT confirmed, DON'T update the fields we're trying to change yet
+            // We want to keep those as-is until the AC confirms the changes
+            // This prevents overwriting currentState with stale values during retries
+            // But we've already updated fields we're NOT trying to change above, and controllerTemp and acError are always updated
+        }
+        // Also update currentState from AC->PRIMARY frames even when there are no pending updates
+        // This ensures currentState stays synchronized with the AC unit
+        else if(ff.messageSource == 0 && ff.messageDest == static_cast<byte>(FujiAddress::PRIMARY) && 
+                ff.messageType == static_cast<byte>(FujiMessageType::STATUS)) {
+            // Update timing for LIN bus - these frames are part of the communication cycle
+            lastFrameReceived = millis();
+            
+            // Update currentState with the actual state from the AC unit
+            currentState.onOff = ff.onOff;
+            currentState.temperature = ff.temperature;
+            currentState.acMode = ff.acMode;
+            currentState.fanMode = ff.fanMode;
+            currentState.swingMode = ff.swingMode;
+            currentState.swingStep = ff.swingStep;
+            currentState.economyMode = ff.economyMode;
+            currentState.acError = ff.acError;
+            
+            // Don't update controllerTemp from AC->PRIMARY frames - these frames don't contain valid controllerTemp
+            // controllerTemp is only valid in frames from PRIMARY (32) to controller or frames to our controller
+        }
+        
         if(ff.messageDest == controllerAddress) {
             lastFrameReceived = millis();
             
             if(ff.messageType == static_cast<byte>(FujiMessageType::STATUS)){
-
-                if(ff.controllerPresent == 1) {
-                    // we have logged into the indoor unit
-                    // this is what most frames are
-                    ff.messageSource     = controllerAddress;
-                    
-                    if(seenSecondaryController) {
-                        ff.messageDest       = static_cast<byte>(FujiAddress::SECONDARY);
-                        ff.loginBit          = true;
-                        ff.controllerPresent = 0;
-                    } else {
-                        ff.messageDest       = static_cast<byte>(FujiAddress::UNIT);
-                        ff.loginBit          = false;
-                        ff.controllerPresent = 1;
+                
+                // Handle case where we have pending updates but haven't started confirmation timer yet
+                // In this case, we still need to construct a reply frame with updates and update currentState
+                // This matches the original library behavior
+                if(updateFields != 0 && (updateFirstSent == 0 || (millis() - updateFirstSent) < 200)) {
+                    // IMPORTANT: First, update currentState with the AC's actual state for fields we're NOT trying to update
+                    // This ensures we have the correct values when constructing frames in sendPendingFrame()
+                    if(!(updateFields & kOnOffUpdateMask)) {
+                        currentState.onOff = ff.onOff;
+                    }
+                    if(!(updateFields & kTempUpdateMask)) {
+                        currentState.temperature = ff.temperature;
+                    }
+                    if(!(updateFields & kModeUpdateMask)) {
+                        currentState.acMode = ff.acMode;
+                    }
+                    if(!(updateFields & kFanModeUpdateMask)) {
+                        currentState.fanMode = ff.fanMode;
+                    }
+                    if(!(updateFields & kSwingModeUpdateMask)) {
+                        currentState.swingMode = ff.swingMode;
+                    }
+                    if(!(updateFields & kSwingStepUpdateMask)) {
+                        currentState.swingStep = ff.swingStep;
+                    }
+                    if(!(updateFields & kEconomyModeUpdateMask)) {
+                        currentState.economyMode = ff.economyMode;
+                    }
+                    currentState.acError = ff.acError;
+                    if(ff.controllerTemp != 0) {
+                        currentState.controllerTemp = ff.controllerTemp;
                     }
                     
-                    ff.updateMagic       = 0;
-                    ff.unknownBit        = true;
-                    ff.writeBit          = 0;
-                    ff.messageType       = static_cast<byte>(FujiMessageType::STATUS);
-                    
-                } else {
-                    if(controllerIsPrimary) {
-                        // if this is the first message we have received, announce ourselves to the indoor unit
+                    // We have pending updates but haven't started checking for confirmation yet
+                    // Construct reply frame with updates (matching original library behavior)
+                    if(ff.controllerPresent == 1) {
                         ff.messageSource     = controllerAddress;
-                        ff.messageDest       = static_cast<byte>(FujiAddress::UNIT);
-                        ff.loginBit          = false;
-                        ff.controllerPresent = 0;
+                        
+                        if(seenSecondaryController) {
+                            ff.messageDest       = static_cast<byte>(FujiAddress::SECONDARY);
+                            ff.loginBit          = true;
+                            ff.controllerPresent = 0;
+                        } else {
+                            ff.messageDest       = static_cast<byte>(FujiAddress::UNIT);
+                            ff.loginBit          = false;
+                            ff.controllerPresent = 1;
+                        }
+                        
+                        ff.updateMagic       = 0;
+                        ff.unknownBit        = true;
+                        ff.writeBit          = 1;  // We have updates
+                        ff.messageType       = static_cast<byte>(FujiMessageType::STATUS);
+                    }
+                    
+                    // Apply pending updates to reply frame
+                    if(updateFields & kOnOffUpdateMask) {
+                        ff.onOff = updateState.onOff;
+                    }
+                    if(updateFields & kTempUpdateMask) {
+                        ff.temperature = updateState.temperature;
+                    }
+                    if(updateFields & kModeUpdateMask) {
+                        ff.acMode = updateState.acMode;
+                    }
+                    if(updateFields & kFanModeUpdateMask) {
+                        ff.fanMode = updateState.fanMode;
+                    }
+                    if(updateFields & kSwingModeUpdateMask) {
+                        ff.swingMode = updateState.swingMode;
+                    }
+                    if(updateFields & kSwingStepUpdateMask) {
+                        ff.swingStep = updateState.swingStep;
+                    }
+                    if(updateFields & kEconomyModeUpdateMask) {
+                        ff.economyMode = updateState.economyMode;
+                    }
+                    
+                    // Update currentState with the modified reply frame for fields we ARE trying to update
+                    // This keeps currentState in sync with what we're sending
+                    if(updateFields & kOnOffUpdateMask) {
+                        currentState.onOff = ff.onOff;
+                    }
+                    if(updateFields & kTempUpdateMask) {
+                        currentState.temperature = ff.temperature;
+                    }
+                    if(updateFields & kModeUpdateMask) {
+                        currentState.acMode = ff.acMode;
+                    }
+                    if(updateFields & kFanModeUpdateMask) {
+                        currentState.fanMode = ff.fanMode;
+                    }
+                    if(updateFields & kSwingModeUpdateMask) {
+                        currentState.swingMode = ff.swingMode;
+                    }
+                    if(updateFields & kSwingStepUpdateMask) {
+                        currentState.swingStep = ff.swingStep;
+                    }
+                    if(updateFields & kEconomyModeUpdateMask) {
+                        currentState.economyMode = ff.economyMode;
+                    }
+                    
+                    // Encode and prepare reply frame
+                    encodeFrame(ff);
+                    if(debugPrint) {
+                        Serial.printf("--> ");
+                        printFrame(writeBuf, ff);
+                    }
+                    for(int i=0;i<8;i++) {
+                        writeBuf[i] ^= 0xFF;
+                    }
+                    pendingFrame = true;
+                    
+                    return true;
+                }
+                
+                // Handle confirmation check when enough time has passed
+                if(updateFields != 0 && updateFirstSent > 0 && (millis() - updateFirstSent) >= 200){
+                    
+                    // Save the ORIGINAL received state values BEFORE we modify the frame
+                    // This ensures we check confirmation against what the AC actually sent, not our modified reply
+                    byte receivedOnOff = ff.onOff;
+                    byte receivedTemp = ff.temperature;
+                    byte receivedMode = ff.acMode;
+                    byte receivedFanMode = ff.fanMode;
+                    byte receivedSwingMode = ff.swingMode;
+                    byte receivedSwingStep = ff.swingStep;
+                    byte receivedEconomyMode = ff.economyMode;
+
+                    if(ff.controllerPresent == 1) {
+                        // we have logged into the indoor unit
+                        // this is what most frames are
+                        ff.messageSource     = controllerAddress;
+                        
+                        if(seenSecondaryController) {
+                            ff.messageDest       = static_cast<byte>(FujiAddress::SECONDARY);
+                            ff.loginBit          = true;
+                            ff.controllerPresent = 0;
+                        } else {
+                            ff.messageDest       = static_cast<byte>(FujiAddress::UNIT);
+                            ff.loginBit          = false;
+                            ff.controllerPresent = 1;
+                        }
+                        
                         ff.updateMagic       = 0;
                         ff.unknownBit        = true;
                         ff.writeBit          = 0;
-                        ff.messageType       = static_cast<byte>(FujiMessageType::LOGIN);
+                        ff.messageType       = static_cast<byte>(FujiMessageType::STATUS);
                         
-                        ff.onOff             = 0;
-                        ff.temperature       = 0;
-                        ff.acMode            = 0;
-                        ff.fanMode           = 0;
-                        ff.swingMode         = 0;
-                        ff.swingStep         = 0;
-                        ff.acError           = 0;
                     } else {
-                        // secondary controller never seems to get any other message types, only status with controllerPresent == 0
-                        // the secondary controller seems to send the same flags no matter which message type
+                        if(controllerIsPrimary) {
+                            // if this is the first message we have received, announce ourselves to the indoor unit
+                            ff.messageSource     = controllerAddress;
+                            ff.messageDest       = static_cast<byte>(FujiAddress::UNIT);
+                            ff.loginBit          = false;
+                            ff.controllerPresent = 0;
+                            ff.updateMagic       = 0;
+                            ff.unknownBit        = true;
+                            ff.writeBit          = 0;
+                            ff.messageType       = static_cast<byte>(FujiMessageType::LOGIN);
+                            
+                            ff.onOff             = 0;
+                            ff.temperature       = 0;
+                            ff.acMode            = 0;
+                            ff.fanMode           = 0;
+                            ff.swingMode         = 0;
+                            ff.swingStep         = 0;
+                            ff.acError           = 0;
+                        } else {
+                            // secondary controller never seems to get any other message types, only status with controllerPresent == 0
+                            // the secondary controller seems to send the same flags no matter which message type
+                            
+                            ff.messageSource     = controllerAddress;
+                            ff.messageDest       = static_cast<byte>(FujiAddress::UNIT);
+                            ff.loginBit          = false;
+                            ff.controllerPresent = 1;
+                            ff.updateMagic       = 2;
+                            ff.unknownBit        = true;
+                            ff.writeBit          = 0;
+                        }
                         
-                        ff.messageSource     = controllerAddress;
-                        ff.messageDest       = static_cast<byte>(FujiAddress::UNIT);
-                        ff.loginBit          = false;
-                        ff.controllerPresent = 1;
-                        ff.updateMagic       = 2;
-                        ff.unknownBit        = true;
-                        ff.writeBit          = 0;
                     }
                     
-                }
-                
-                // Check if the unit has applied our updates by comparing received state with what we sent
-                // Only clear updateFields if the unit has confirmed the changes
-                bool updatesConfirmed = true;
-                if(updateFields & kOnOffUpdateMask) {
-                    if(ff.onOff != updateState.onOff) {
-                        updatesConfirmed = false;
+                    // Check if the unit has applied our updates by comparing ORIGINAL received state with what we sent
+                    // Only clear updateFields if the unit has confirmed the changes
+                    bool updatesConfirmed = true;
+                    if(updateFields & kOnOffUpdateMask) {
+                        if(receivedOnOff != updateState.onOff) {
+                            updatesConfirmed = false;
+                            if(debugPrint) {
+                                Serial.printf("OnOff mismatch: received=%d, expected=%d\n", receivedOnOff, updateState.onOff);
+                            }
+                        }
                     }
-                }
-                if(updateFields & kTempUpdateMask) {
-                    if(ff.temperature != updateState.temperature) {
-                        updatesConfirmed = false;
+                    if(updateFields & kTempUpdateMask) {
+                        if(receivedTemp != updateState.temperature) {
+                            updatesConfirmed = false;
+                            if(debugPrint) {
+                                Serial.printf("Temp mismatch: received=%d, expected=%d\n", receivedTemp, updateState.temperature);
+                            }
+                        }
                     }
-                }
-                if(updateFields & kModeUpdateMask) {
-                    if(ff.acMode != updateState.acMode) {
-                        updatesConfirmed = false;
+                    if(updateFields & kModeUpdateMask) {
+                        if(receivedMode != updateState.acMode) {
+                            updatesConfirmed = false;
+                            if(debugPrint) {
+                                Serial.printf("Mode mismatch: received=%d, expected=%d\n", receivedMode, updateState.acMode);
+                            }
+                        }
                     }
-                }
-                if(updateFields & kFanModeUpdateMask) {
-                    if(ff.fanMode != updateState.fanMode) {
-                        updatesConfirmed = false;
+                    if(updateFields & kFanModeUpdateMask) {
+                        if(receivedFanMode != updateState.fanMode) {
+                            updatesConfirmed = false;
+                            if(debugPrint) {
+                                Serial.printf("FanMode mismatch: received=%d, expected=%d\n", receivedFanMode, updateState.fanMode);
+                            }
+                        }
                     }
-                }
-                if(updateFields & kSwingModeUpdateMask) {
-                    if(ff.swingMode != updateState.swingMode) {
-                        updatesConfirmed = false;
+                    if(updateFields & kSwingModeUpdateMask) {
+                        if(receivedSwingMode != updateState.swingMode) {
+                            updatesConfirmed = false;
+                            if(debugPrint) {
+                                Serial.printf("SwingMode mismatch: received=%d, expected=%d\n", receivedSwingMode, updateState.swingMode);
+                            }
+                        }
                     }
-                }
-                if(updateFields & kSwingStepUpdateMask) {
-                    if(ff.swingStep != updateState.swingStep) {
-                        updatesConfirmed = false;
+                    if(updateFields & kSwingStepUpdateMask) {
+                        if(receivedSwingStep != updateState.swingStep) {
+                            updatesConfirmed = false;
+                            if(debugPrint) {
+                                Serial.printf("SwingStep mismatch: received=%d, expected=%d\n", receivedSwingStep, updateState.swingStep);
+                            }
+                        }
                     }
-                }
-                if(updateFields & kEconomyModeUpdateMask) {
-                    if(ff.economyMode != updateState.economyMode) {
-                        updatesConfirmed = false;
+                    if(updateFields & kEconomyModeUpdateMask) {
+                        if(receivedEconomyMode != updateState.economyMode) {
+                            updatesConfirmed = false;
+                            if(debugPrint) {
+                                Serial.printf("EconomyMode mismatch: received=%d, expected=%d\n", receivedEconomyMode, updateState.economyMode);
+                            }
+                        }
                     }
-                }
-                
-                // If updates are confirmed, clear the flags and reset retry counter
-                // Otherwise, keep them set so sendPendingFrame() will retry
-                if(updatesConfirmed) {
-                    if(debugPrint && updateRetryCount > 0) {
-                        Serial.printf("Updates confirmed after %d retries\n", updateRetryCount);
+                    
+                    // If updates are confirmed, clear the flags and reset retry counter
+                    // Otherwise, keep them set so sendPendingFrame() will retry
+                    if(updatesConfirmed && updateFields != 0) {
+                        if(debugPrint && updateRetryCount > 0) {
+                            Serial.printf("Updates confirmed after %d retries (from controller frame)\n", updateRetryCount);
+                        }
+                        updateFields = 0;
+                        updateRetryCount = 0;
+                        lastRetryAttempt = 0;
+                        updateFirstSent = 0;
                     }
-                    updateFields = 0;
-                    updateRetryCount = 0;
-                }
-                
-                // if we have any remaining updates, set the flags in the reply
-                if(updateFields) {
-                    ff.writeBit = 1;
-                }
-                
-                if(updateFields & kOnOffUpdateMask) {
-                    ff.onOff = updateState.onOff;
-                }
-                
-                if(updateFields & kTempUpdateMask) {
-                    ff.temperature = updateState.temperature;
-                }
-                
-                if(updateFields & kModeUpdateMask) {
-                    ff.acMode = updateState.acMode;
-                }
-                
-                if(updateFields & kFanModeUpdateMask) {
-                    ff.fanMode = updateState.fanMode;
-                }
-                
-                if(updateFields & kSwingModeUpdateMask) {
-                    ff.swingMode = updateState.swingMode;
-                }
-                
-                if(updateFields & kSwingStepUpdateMask) {
-                    ff.swingStep = updateState.swingStep;
-                }
+                    
+                    // if we have any remaining updates, set the flags in the reply
+                    if(updateFields) {
+                        ff.writeBit = 1;
+                    }
+                    
+                    if(updateFields & kOnOffUpdateMask) {
+                        ff.onOff = updateState.onOff;
+                    }
+                    
+                    if(updateFields & kTempUpdateMask) {
+                        ff.temperature = updateState.temperature;
+                    }
+                    
+                    if(updateFields & kModeUpdateMask) {
+                        ff.acMode = updateState.acMode;
+                    }
+                    
+                    if(updateFields & kFanModeUpdateMask) {
+                        ff.fanMode = updateState.fanMode;
+                    }
+                    
+                    if(updateFields & kSwingModeUpdateMask) {
+                        ff.swingMode = updateState.swingMode;
+                    }
+                    
+                    if(updateFields & kSwingStepUpdateMask) {
+                        ff.swingStep = updateState.swingStep;
+                    }
 
-                if(updateFields & kEconomyModeUpdateMask) {
-                    ff.economyMode = updateState.economyMode;
-                }
-                
-                // Update currentState with what the unit actually has
-                memcpy(&currentState, &ff, sizeof(FujiFrame));
+                    if(updateFields & kEconomyModeUpdateMask) {
+                        ff.economyMode = updateState.economyMode;
+                    }
+                    
+                    // Always update acError - this is a sensor reading that changes independently
+                    // and should always be kept current, regardless of whether other updates are confirmed
+                    currentState.acError = ff.acError;
+                    
+                    // Only update controllerTemp if it's non-zero (0 indicates the frame doesn't contain valid controllerTemp)
+                    // controllerTemp is only valid in frames from PRIMARY (32) to controller or frames to our controller
+                    // Frames from AC (0) to PRIMARY (32) have controllerTemp=0 and should not overwrite the correct value
+                    if(ff.controllerTemp != 0) {
+                        currentState.controllerTemp = ff.controllerTemp;
+                    }
+                    
+                    // Update currentState with the modified reply frame (which includes our pending updates)
+                    // This keeps currentState in sync with what we're sending, matching the original library behavior
+                    // This is important for frame consistency - the AC may expect fields to match what we sent previously
+                    currentState.onOff = ff.onOff;
+                    currentState.temperature = ff.temperature;
+                    currentState.acMode = ff.acMode;
+                    currentState.fanMode = ff.fanMode;
+                    currentState.swingMode = ff.swingMode;
+                    currentState.swingStep = ff.swingStep;
+                    currentState.economyMode = ff.economyMode;
+                    // Note: We update currentState with the reply frame values (including our updates) immediately
+                    // This matches the original library behavior and ensures frame consistency
+                    // We still only clear updateFields after confirmation, so retries will continue until confirmed
+                    
+                    // Note: Zone information is NOT in STATUS messages - it's only in actual zone messages
+                    // Zone state is updated when zone messages are received (handled in zone message handlers above)
 
+                }
+                // Handle case when there are no pending updates
+                // Still construct a reply frame and update currentState (matching original library behavior)
+                else if(updateFields == 0) {
+                    // Construct reply frame (matching original library behavior)
+                    if(ff.controllerPresent == 1) {
+                        ff.messageSource     = controllerAddress;
+                        
+                        if(seenSecondaryController) {
+                            ff.messageDest       = static_cast<byte>(FujiAddress::SECONDARY);
+                            ff.loginBit          = true;
+                            ff.controllerPresent = 0;
+                        } else {
+                            ff.messageDest       = static_cast<byte>(FujiAddress::UNIT);
+                            ff.loginBit          = false;
+                            ff.controllerPresent = 1;
+                        }
+                        
+                        ff.updateMagic       = 0;
+                        ff.unknownBit        = true;
+                        ff.writeBit          = 0;  // No updates
+                        ff.messageType       = static_cast<byte>(FujiMessageType::STATUS);
+                    }
+                    
+                    // Update currentState with the reply frame (matching original library behavior)
+                    // This keeps currentState in sync with what we're sending
+                    currentState.onOff = ff.onOff;
+                    currentState.temperature = ff.temperature;
+                    currentState.acMode = ff.acMode;
+                    currentState.fanMode = ff.fanMode;
+                    currentState.swingMode = ff.swingMode;
+                    currentState.swingStep = ff.swingStep;
+                    currentState.economyMode = ff.economyMode;
+                    currentState.acError = ff.acError;
+                    
+                    // Only update controllerTemp if it's non-zero (0 indicates the frame doesn't contain valid controllerTemp)
+                    // This prevents overwriting a valid value with 0 from frames that don't contain controllerTemp
+                    if(ff.controllerTemp != 0) {
+                        currentState.controllerTemp = ff.controllerTemp;
+                    }
+                }
             }
             else if(ff.messageType == static_cast<byte>(FujiMessageType::LOGIN)){
                 // received a login frame OK frame
@@ -638,17 +1095,23 @@ bool FujiHeatPump::waitForFrame() {
                 if(isZoneMessage(readBuf)) {
                     ZoneFrame zf = decodeZoneFrame();
                     
-                    if(debugPrint) {
-                        Serial.printf("<-- ZONE (misidentified as ERROR): %X %X %X %X %X %X %X %X  ", 
-                            readBuf[0], readBuf[1], readBuf[2], readBuf[3], 
-                            readBuf[4], readBuf[5], readBuf[6], readBuf[7]);
-                        Serial.printf("zoneGroup: %d, zones[0]: %d, zones[1]: %d\n",
-                            static_cast<byte>(zf.zoneGroup), zf.zones[0], zf.zones[1]);
-                    }
+                    // Update lastFrameReceived FIRST, before any blocking operations
+                    // This ensures timing calculations are accurate
+                    lastFrameReceived = millis();
                     
                     // Update current zone state
                     memcpy(&currentZoneState, &zf, sizeof(ZoneFrame));
                     initialZoneStateReceived = true;
+                    
+                    // Debug prints AFTER timing-critical operations (combined to reduce blocking)
+                    if(debugPrint) {
+                        Serial.printf("<-- ZONE (misidentified as ERROR): %X %X %X %X %X %X %X %X  zoneGroup: %d, zones[0]: %d, zones[1]: %d (updated)\n",
+                            readBuf[0], readBuf[1], readBuf[2], readBuf[3], 
+                            readBuf[4], readBuf[5], readBuf[6], readBuf[7],
+                            static_cast<byte>(currentZoneState.zoneGroup), 
+                            currentZoneState.zones[0], 
+                            currentZoneState.zones[1]);
+                    }
                     
                     // Don't send a reply for zone messages
                     return true;
@@ -703,36 +1166,50 @@ void FujiHeatPump::setOnOff(bool o){
     updateFields |= kOnOffUpdateMask;
     updateState.onOff = o ? 1 : 0;
     updateRetryCount = 0;  // Reset retry counter for new update
+    lastRetryAttempt = 0;  // Reset retry attempt timer for new update
+    updateFirstSent = 0;   // Reset update first sent timer for new update
 }
 void FujiHeatPump::setTemp(byte t){
     updateFields |= kTempUpdateMask;
     updateState.temperature = t;
     updateRetryCount = 0;  // Reset retry counter for new update
+    lastRetryAttempt = 0;  // Reset retry attempt timer for new update
+    updateFirstSent = 0;   // Reset update first sent timer for new update
 }
 void FujiHeatPump::setMode(byte m){
     updateFields |= kModeUpdateMask;
     updateState.acMode = m;
     updateRetryCount = 0;  // Reset retry counter for new update
+    lastRetryAttempt = 0;  // Reset retry attempt timer for new update
+    updateFirstSent = 0;   // Reset update first sent timer for new update
 }
 void FujiHeatPump::setFanMode(byte fm){
     updateFields |= kFanModeUpdateMask;
     updateState.fanMode = fm;
     updateRetryCount = 0;  // Reset retry counter for new update
+    lastRetryAttempt = 0;  // Reset retry attempt timer for new update
+    updateFirstSent = 0;   // Reset update first sent timer for new update
 }
 void FujiHeatPump::setEconomyMode(byte em){
     updateFields |= kEconomyModeUpdateMask;
     updateState.economyMode = em;
     updateRetryCount = 0;  // Reset retry counter for new update
+    lastRetryAttempt = 0;  // Reset retry attempt timer for new update
+    updateFirstSent = 0;   // Reset update first sent timer for new update
 }
 void FujiHeatPump::setSwingMode(byte sm){
     updateFields |= kSwingModeUpdateMask;
     updateState.swingMode = sm;
     updateRetryCount = 0;  // Reset retry counter for new update
+    lastRetryAttempt = 0;  // Reset retry attempt timer for new update
+    updateFirstSent = 0;   // Reset update first sent timer for new update
 }
 void FujiHeatPump::setSwingStep(byte ss){
     updateFields |= kSwingStepUpdateMask;
     updateState.swingStep = ss;
     updateRetryCount = 0;  // Reset retry counter for new update
+    lastRetryAttempt = 0;  // Reset retry attempt timer for new update
+    updateFirstSent = 0;   // Reset update first sent timer for new update
 }
 
 bool FujiHeatPump::getOnOff(){
@@ -836,11 +1313,19 @@ void FujiHeatPump::setZoneOnOff(int zone, bool on) {
 }
 
 FujiZoneGroup FujiHeatPump::getZoneGroup() {
+    if(!initialZoneStateReceived) {
+        // No zone state received yet, return NONE
+        return FujiZoneGroup::NONE;
+    }
     return currentZoneState.zoneGroup;
 }
 
 bool FujiHeatPump::getZoneOnOff(int zone) {
     if(zone >= 0 && zone < kZoneCount) {
+        if(!initialZoneStateReceived) {
+            // No zone state received yet, return false
+            return false;
+        }
         return currentZoneState.zones[zone];
     }
     return false;

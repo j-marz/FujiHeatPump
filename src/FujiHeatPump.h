@@ -66,6 +66,11 @@ const byte kZoneMessageSignature0 = 0x20;
 const byte kZoneMessageSignature1 = 0xA1;
 const byte kZoneMessageSignature2 = 0x58;
 
+// LIN bus timing constants
+const unsigned long kMinFrameDelay = 50;  // Minimum delay after receiving frame before sending (ms)
+const unsigned long kMaxFrameDelay = 60;  // Maximum delay after receiving frame before sending (ms)
+const unsigned long kMinRetryDelay = 100; // Minimum delay between retry attempts (ms) - prevents rapid-fire retries
+
 
 typedef struct FujiFrames  {
     byte onOff = 0;
@@ -126,6 +131,8 @@ class FujiHeatPump
     bool            controllerLoggedIn = false; 
     unsigned long   lastFrameReceived;
     unsigned long   lastFrameSent;
+    unsigned long   lastRetryAttempt;  // Track when we last attempted to send (for retry backoff)
+    unsigned long   updateFirstSent;   // Track when we first sent the update (for confirmation delay)
     
     byte            updateFields;
     FujiFrame       updateState;
@@ -227,4 +234,4 @@ const byte kEconomyModeUpdateMask = 0b00001000;
 const byte kSwingModeUpdateMask   = 0b00000100;
 const byte kSwingStepUpdateMask   = 0b00000010;
 
-const byte kMaxUpdateRetries = 10;  // Maximum number of retry attempts before giving up
+const byte kMaxUpdateRetries = 15;  // Maximum number of retry attempts before giving up
