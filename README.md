@@ -21,8 +21,15 @@ void setup() {
 void loop() {
   if(hp.waitForFrame()) {   // attempt to read state from bus and place a reply frame in the buffer
     delay(60);              // frames should be sent 50-60ms after recieving - potentially other work can be done here
-    hp.sendPendingFrame();  // send any frame waiting in the buffer
+    // Send regular frame if pending (takes priority)
+    if(hp.updatePending()) {
+      hp.sendPendingFrame();
+    }
   }
+  // Zone frames are sent independently, with timing checks to ensure
+  // they're not sent too close to regular frames
+  hp.sendPendingZoneFrame();
+}
   
   //do an update
   if(weWantToUpdate) {
@@ -30,6 +37,7 @@ void loop() {
     hp.setMode(static_cast<byte>(FujiMode::COOL));
     hp.setFanMode(4);
     hp.setTemp(18);
+    hp.setZoneOnOff(0, true); // OR for zone groups hp.setZoneGroup(FujiZoneGroup::DAY);
   }
   
   //get the current status
@@ -37,6 +45,8 @@ void loop() {
   hp.getMode();
   hp.getFanMode();
   hp.getTemp();
+  hp.getZoneOnOff();
+  hp.getZoneGroup();
 }
 
 ```
