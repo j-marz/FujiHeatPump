@@ -244,6 +244,7 @@ void FujiHeatPump::connect(HardwareSerial *serial, bool secondary, int rxPin=-1,
     
     lastFrameReceived = 0;
     lastFrameSent = 0;
+    updateRetryCount = 0;
 }
 
 void printBinary(byte value) {
@@ -268,7 +269,7 @@ void FujiHeatPump::sendPendingFrame() {
     // Check if we have updates to send
     if(!updateFields) {
         // No updates pending, but check if we have a pre-encoded frame
-        if(pendingFrame && (millis() - lastFrameReceived) > 50) {
+        if(pendingFrame && (millis() - lastFrameReceived) > 60) {
             _serial->write(writeBuf, 8);
             _serial->flush();
             pendingFrame = false;
@@ -278,86 +279,110 @@ void FujiHeatPump::sendPendingFrame() {
         return;
     }
     
+    // Check retry limit to prevent DOSing the controller
+    if(updateRetryCount >= kMaxUpdateRetries) {
+        // Max retries exceeded, give up to prevent overwhelming the controller
+        if(debugPrint) {
+            Serial.printf("WARNING: Max retries (%d) exceeded for updates, clearing pending updates\n", kMaxUpdateRetries);
+        }
+        updateFields = 0;
+        updateRetryCount = 0;
+        return;
+    }
+    
     // We have updates to send - construct a frame even if pendingFrame is false
     // This handles the case where we received a zone message but have regular updates pending
-    if((millis() - lastFrameReceived) > 50 || lastFrameReceived == 0) {
-        FujiFrame ff;
-        
-        // Start with current state
-        memcpy(&ff, &currentState, sizeof(FujiFrame));
-        
-        // Set up frame structure based on controller state
-        ff.messageSource = controllerAddress;
-        
-        if(seenSecondaryController) {
-            ff.messageDest = static_cast<byte>(FujiAddress::SECONDARY);
-            ff.loginBit = true;
-            ff.controllerPresent = 0;
-        } else {
-            ff.messageDest = static_cast<byte>(FujiAddress::UNIT);
-            ff.loginBit = false;
-            ff.controllerPresent = 1;
-        }
-        
-        ff.updateMagic = 0;
-        ff.unknownBit = true;
-        ff.writeBit = 1;  // We have updates, so set write bit
-        ff.messageType = static_cast<byte>(FujiMessageType::STATUS);
-        
-        // Apply pending updates (ff already has currentState copied, so we just override updated fields)
-        if(updateFields & kOnOffUpdateMask) {
-            ff.onOff = updateState.onOff;
-        }
-        if(updateFields & kTempUpdateMask) {
-            ff.temperature = updateState.temperature;
-        }
-        if(updateFields & kModeUpdateMask) {
-            ff.acMode = updateState.acMode;
-        }
-        if(updateFields & kFanModeUpdateMask) {
-            ff.fanMode = updateState.fanMode;
-        }
-        if(updateFields & kSwingModeUpdateMask) {
-            ff.swingMode = updateState.swingMode;
-        }
-        if(updateFields & kSwingStepUpdateMask) {
-            ff.swingStep = updateState.swingStep;
-        }
-        if(updateFields & kEconomyModeUpdateMask) {
-            ff.economyMode = updateState.economyMode;
-        }
-        
-        // Encode and send
-        encodeFrame(ff);
-        
-        if(debugPrint) {
-            Serial.printf("--> (constructed) ");
-            printFrame(writeBuf, ff);
-        }
-        
-        for(int i=0; i<8; i++) {
-            writeBuf[i] ^= 0xFF;
-        }
-        
-        _serial->write(writeBuf, 8);
-        _serial->flush();
-        pendingFrame = false;
-        updateFields = 0;
-        lastFrameSent = millis();
-        
-        _serial->readBytes(writeBuf, 8); // read back our own frame so we dont process it again
-        
-        // Update current state
-        memcpy(&currentState, &ff, sizeof(FujiFrame));
+    // Increase timing window to 60ms for more reliability
+    unsigned long timeSinceLastFrame = (lastFrameSent > 0) ? (millis() - lastFrameSent) : (millis() - lastFrameReceived);
+    if(timeSinceLastFrame < 60 && lastFrameReceived != 0) {
+        // Not enough time has passed, wait for next cycle
+        // DON'T clear updateFields - keep them pending
+        return;
     }
+    
+    FujiFrame ff;
+    
+    // Start with current state
+    memcpy(&ff, &currentState, sizeof(FujiFrame));
+    
+    // Set up frame structure based on controller state
+    ff.messageSource = controllerAddress;
+    
+    if(seenSecondaryController) {
+        ff.messageDest = static_cast<byte>(FujiAddress::SECONDARY);
+        ff.loginBit = true;
+        ff.controllerPresent = 0;
+    } else {
+        ff.messageDest = static_cast<byte>(FujiAddress::UNIT);
+        ff.loginBit = false;
+        ff.controllerPresent = 1;
+    }
+    
+    ff.updateMagic = 0;
+    ff.unknownBit = true;
+    ff.writeBit = 1;  // We have updates, so set write bit
+    ff.messageType = static_cast<byte>(FujiMessageType::STATUS);
+    
+    // Apply pending updates (ff already has currentState copied, so we just override updated fields)
+    if(updateFields & kOnOffUpdateMask) {
+        ff.onOff = updateState.onOff;
+    }
+    if(updateFields & kTempUpdateMask) {
+        ff.temperature = updateState.temperature;
+    }
+    if(updateFields & kModeUpdateMask) {
+        ff.acMode = updateState.acMode;
+    }
+    if(updateFields & kFanModeUpdateMask) {
+        ff.fanMode = updateState.fanMode;
+    }
+    if(updateFields & kSwingModeUpdateMask) {
+        ff.swingMode = updateState.swingMode;
+    }
+    if(updateFields & kSwingStepUpdateMask) {
+        ff.swingStep = updateState.swingStep;
+    }
+    if(updateFields & kEconomyModeUpdateMask) {
+        ff.economyMode = updateState.economyMode;
+    }
+    
+    // Encode and send
+    encodeFrame(ff);
+    
+    if(debugPrint) {
+        Serial.printf("--> (constructed) ");
+        printFrame(writeBuf, ff);
+    }
+    
+    for(int i=0; i<8; i++) {
+        writeBuf[i] ^= 0xFF;
+    }
+    
+    _serial->write(writeBuf, 8);
+    _serial->flush();
+    pendingFrame = false;
+    // DON'T clear updateFields here - wait for confirmation from unit
+    // Store what we sent so we can verify it was applied
+    updateRetryCount++;  // Increment retry counter
+    lastFrameSent = millis();
+    
+    if(debugPrint) {
+        Serial.printf("Sent update frame (retry %d/%d)\n", updateRetryCount, kMaxUpdateRetries);
+    }
+    
+    _serial->readBytes(writeBuf, 8); // read back our own frame so we dont process it again
+    
+    // DON'T update currentState here - wait for confirmation from the unit
+    // This ensures currentState reflects what the unit actually has, not what we sent
 }
 
 bool FujiHeatPump::sendPendingZoneFrame() {
     if(pendingZoneFrame) {
         // Ensure enough time has passed since last frame was sent/received
         // This prevents sending zone frames too close to regular frames
+        // Increase to 60ms for more reliability
         unsigned long timeSinceLastFrame = (lastFrameSent > 0) ? (millis() - lastFrameSent) : (millis() - lastFrameReceived);
-        if(timeSinceLastFrame < 50) {
+        if(timeSinceLastFrame < 60) {
             // Not enough time has passed, wait for next cycle
             return false;
         }
@@ -503,7 +528,56 @@ bool FujiHeatPump::waitForFrame() {
                     
                 }
                 
-                // if we have any updates, set the flags
+                // Check if the unit has applied our updates by comparing received state with what we sent
+                // Only clear updateFields if the unit has confirmed the changes
+                bool updatesConfirmed = true;
+                if(updateFields & kOnOffUpdateMask) {
+                    if(ff.onOff != updateState.onOff) {
+                        updatesConfirmed = false;
+                    }
+                }
+                if(updateFields & kTempUpdateMask) {
+                    if(ff.temperature != updateState.temperature) {
+                        updatesConfirmed = false;
+                    }
+                }
+                if(updateFields & kModeUpdateMask) {
+                    if(ff.acMode != updateState.acMode) {
+                        updatesConfirmed = false;
+                    }
+                }
+                if(updateFields & kFanModeUpdateMask) {
+                    if(ff.fanMode != updateState.fanMode) {
+                        updatesConfirmed = false;
+                    }
+                }
+                if(updateFields & kSwingModeUpdateMask) {
+                    if(ff.swingMode != updateState.swingMode) {
+                        updatesConfirmed = false;
+                    }
+                }
+                if(updateFields & kSwingStepUpdateMask) {
+                    if(ff.swingStep != updateState.swingStep) {
+                        updatesConfirmed = false;
+                    }
+                }
+                if(updateFields & kEconomyModeUpdateMask) {
+                    if(ff.economyMode != updateState.economyMode) {
+                        updatesConfirmed = false;
+                    }
+                }
+                
+                // If updates are confirmed, clear the flags and reset retry counter
+                // Otherwise, keep them set so sendPendingFrame() will retry
+                if(updatesConfirmed) {
+                    if(debugPrint && updateRetryCount > 0) {
+                        Serial.printf("Updates confirmed after %d retries\n", updateRetryCount);
+                    }
+                    updateFields = 0;
+                    updateRetryCount = 0;
+                }
+                
+                // if we have any remaining updates, set the flags in the reply
                 if(updateFields) {
                     ff.writeBit = 1;
                 }
@@ -536,6 +610,7 @@ bool FujiHeatPump::waitForFrame() {
                     ff.economyMode = updateState.economyMode;
                 }
                 
+                // Update currentState with what the unit actually has
                 memcpy(&currentState, &ff, sizeof(FujiFrame));
 
             }
@@ -626,31 +701,38 @@ bool FujiHeatPump::updatePending() {
 
 void FujiHeatPump::setOnOff(bool o){
     updateFields |= kOnOffUpdateMask;
-    updateState.onOff = o ? 1 : 0;   
+    updateState.onOff = o ? 1 : 0;
+    updateRetryCount = 0;  // Reset retry counter for new update
 }
 void FujiHeatPump::setTemp(byte t){
     updateFields |= kTempUpdateMask;
     updateState.temperature = t;
+    updateRetryCount = 0;  // Reset retry counter for new update
 }
 void FujiHeatPump::setMode(byte m){
     updateFields |= kModeUpdateMask;
     updateState.acMode = m;
+    updateRetryCount = 0;  // Reset retry counter for new update
 }
 void FujiHeatPump::setFanMode(byte fm){
     updateFields |= kFanModeUpdateMask;
     updateState.fanMode = fm;
+    updateRetryCount = 0;  // Reset retry counter for new update
 }
 void FujiHeatPump::setEconomyMode(byte em){
     updateFields |= kEconomyModeUpdateMask;
     updateState.economyMode = em;
+    updateRetryCount = 0;  // Reset retry counter for new update
 }
 void FujiHeatPump::setSwingMode(byte sm){
     updateFields |= kSwingModeUpdateMask;
     updateState.swingMode = sm;
+    updateRetryCount = 0;  // Reset retry counter for new update
 }
 void FujiHeatPump::setSwingStep(byte ss){
     updateFields |= kSwingStepUpdateMask;
-    updateState.swingStep = ss;  
+    updateState.swingStep = ss;
+    updateRetryCount = 0;  // Reset retry counter for new update
 }
 
 bool FujiHeatPump::getOnOff(){

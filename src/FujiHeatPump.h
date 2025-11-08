@@ -130,6 +130,7 @@ class FujiHeatPump
     byte            updateFields;
     FujiFrame       updateState;
     FujiFrame       currentState;
+    byte            updateRetryCount = 0;  // Track retry attempts for pending updates
     
     ZoneFrame       currentZoneState;
     ZoneFrame       zoneUpdateState;
@@ -225,3 +226,5 @@ const byte kFanModeUpdateMask     = 0b00010000;
 const byte kEconomyModeUpdateMask = 0b00001000;
 const byte kSwingModeUpdateMask   = 0b00000100;
 const byte kSwingStepUpdateMask   = 0b00000010;
+
+const byte kMaxUpdateRetries = 10;  // Maximum number of retry attempts before giving up
