@@ -46,6 +46,26 @@ const byte kControllerTempIndex = 6;
 const byte kControllerTempMask = 0b01111110;
 const byte kControllerTempOffset = 1;
 
+// Zone message constants
+const byte kZoneGroupIndex = 4;
+const byte kZoneGroupMask = 0b00011000;
+const byte kZoneGroupOffset = 3;
+
+const byte kZoneWriteBitIndex = 4;
+const byte kZoneWriteBitMask = 0b10000000;
+const byte kZoneWriteBitOffset = 7;
+
+const byte kZoneStateIndex = 3;
+const byte kZoneStateMask = 0b00000011;
+const byte kZoneStateOffset = 0;
+
+const size_t kZoneCount = 8;
+
+// Zone message signature (bytes 0-2 pattern)
+const byte kZoneMessageSignature0 = 0x20;
+const byte kZoneMessageSignature1 = 0xA1;
+const byte kZoneMessageSignature2 = 0x58;
+
 
 typedef struct FujiFrames  {
     byte onOff = 0;
@@ -69,26 +89,59 @@ typedef struct FujiFrames  {
     byte messageDest = 0;
 } FujiFrame;
 
+enum class FujiZoneGroup : byte {
+    NONE = 0x0,
+    DAY = 0x1,
+    NIGHT = 0x2,
+    ALL = 0x3,
+};
+
+typedef struct ZoneFrames {
+    bool zones[kZoneCount];
+    FujiZoneGroup zoneGroup;
+    bool zoneWriteBit;
+    bool dayZones[kZoneCount];
+    bool nightZones[kZoneCount];
+
+    bool writeBit = false;
+    bool loginBit = false;
+    bool unknownBit = false;
+
+    byte messageType = 0;
+    byte messageSource = 0;
+    byte messageDest = 0;
+} ZoneFrame;
+
 class FujiHeatPump
 {
   private:
     HardwareSerial *_serial;
     byte            readBuf[8];
     byte            writeBuf[8];
+    byte            zoneWriteBuf[8];
     
     byte            controllerAddress;  
     bool            controllerIsPrimary = true;  
     bool            seenSecondaryController = false;  
     bool            controllerLoggedIn = false; 
     unsigned long   lastFrameReceived;
+    unsigned long   lastFrameSent;
     
     byte            updateFields;
     FujiFrame       updateState;
     FujiFrame       currentState;
+    
+    ZoneFrame       currentZoneState;
+    ZoneFrame       zoneUpdateState;
+    bool            initialZoneStateReceived = false;
+    bool            pendingZoneFrame = false;
 
     FujiFrame decodeFrame();
+    ZoneFrame decodeZoneFrame();
     void encodeFrame(FujiFrame ff);
+    void encodeZoneFrame(ZoneFrame zf);
     void printFrame(byte buf[8], FujiFrame ff);
+    bool isZoneMessage(byte buf[8]);
     
     bool pendingFrame = false;
   public:
@@ -97,6 +150,7 @@ class FujiHeatPump
 
     bool waitForFrame();
     void sendPendingFrame();
+    bool sendPendingZoneFrame();
     bool isBound();
     bool updatePending();
     
@@ -108,6 +162,9 @@ class FujiHeatPump
     void setSwingMode(byte sm);
     void setSwingStep(byte ss);
     
+    void setZoneGroup(FujiZoneGroup zoneGroup);
+    void setZoneOnOff(int zone, bool on);
+    
     bool getOnOff();
     byte getTemp();
     byte getMode();
@@ -117,8 +174,12 @@ class FujiHeatPump
     byte getSwingStep();
     byte getControllerTemp();
     
+    FujiZoneGroup getZoneGroup();
+    bool getZoneOnOff(int zone);
+    
     FujiFrame *getCurrentState();
     FujiFrame *getUpdateState();
+    ZoneFrame *getCurrentZoneState();
     byte getUpdateFields();
     
     bool debugPrint = false;
@@ -139,6 +200,7 @@ enum class FujiMessageType : byte {
   ERROR   = 1,
   LOGIN   = 2,
   UNKNOWN = 3,
+  ZONE    = 5,
 };
 
 enum class FujiAddress : byte {
